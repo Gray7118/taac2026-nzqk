@@ -1,0 +1,57 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Local/editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Local environment files
+.env
+.env.*
+*.local
+
+# Temporary workspace files
+.tmp/
+tmp/
+temp/
+
+# Data files and generated demo data
+*.parquet
+demo_data/
+data/
+
+# Training outputs
+ckpt/
+ckpt_*/
+checkpoints/
+outputs/
+runs/
+logs/
+logs_*/
+tf_events/
+tf_events_*/
+events.out.tfevents.*
+
+# Model artifacts
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Logs
+*.log
