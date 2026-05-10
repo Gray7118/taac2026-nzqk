@@ -13,10 +13,12 @@ import os
 import json
 import argparse
 import logging
+import datetime
 from pathlib import Path
 from typing import List, Tuple
 
 import torch
+import torch.distributed as dist
 
 from utils import set_seed, EarlyStopping, create_logger
 from dataset import FeatureSchema, get_pcvr_data, NUM_TIME_BUCKETS
@@ -212,14 +214,55 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    # Create output directories.
+    # Create output directories first (needed for logging)
     Path(args.ckpt_dir).mkdir(parents=True, exist_ok=True)
     Path(args.log_dir).mkdir(parents=True, exist_ok=True)
     Path(args.tf_events_dir).mkdir(parents=True, exist_ok=True)
 
-    # Initialize logger and RNG.
+    # Initialize logger early (before any logging in multi-process environments)
     set_seed(args.seed)
-    create_logger(os.path.join(args.log_dir, 'train.log'))
+    log_path = os.path.join(args.log_dir, 'train.log')
+    create_logger(log_path)
+
+    # Auto-detect GPU count and enable DDP automatically
+    gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    
+    if gpu_count > 1:
+        args.use_ddp = True
+        args.world_size = gpu_count
+        
+        # Initialize DDP group if not already initialized
+        if not dist.is_initialized():
+            local_rank = int(os.getenv('LOCAL_RANK', '0'))
+            args.local_rank = local_rank
+            
+            master_addr = os.getenv('MASTER_ADDR', '127.0.0.1')
+            master_port = int(os.getenv('MASTER_PORT', '29500'))
+            
+            dist.init_process_group(
+                backend="nccl",
+                init_method=f"tcp://{master_addr}:{master_port}",
+                world_size=args.world_size,
+                rank=local_rank,
+                timeout=datetime.timedelta(minutes=30),
+            )
+            
+            # Use standard print for critical info (works better in distributed env)
+            print(f"[DDP] Auto-enabled: {gpu_count} GPUs, rank={local_rank}")
+    else:
+        args.use_ddp = False
+        args.local_rank = 0
+        args.world_size = 1
+        # Use standard print for single-GPU mode too
+        print("[Single-GPU] Single-gpu mode detected")
+    
+    # Set device based on rank
+    device = f"cuda:{args.local_rank}" if torch.cuda.is_available() else "cpu"
+    old_device = args.device
+    args.device = device
+
+    # Now log with proper logger
+    logging.info(f"Logger created at {log_path}")
     logging.info(f"Args: {vars(args)}")
 
     from torch.utils.tensorboard import SummaryWriter
@@ -253,6 +296,9 @@ def main() -> None:
         buffer_batches=args.buffer_batches,
         seed=args.seed,
         seq_max_lens=seq_max_lens,
+        use_ddp=args.use_ddp,
+        world_size=args.world_size,
+        local_rank=args.local_rank,
     )
 
     # ---- NS groups ----
@@ -307,8 +353,17 @@ def main() -> None:
         "item_ns_tokens": args.item_ns_tokens,
     }
 
-    model = PCVRHyFormer(**model_args).to(args.device)
+    model = PCVRHyFormer(**model_args).to(device)
 
+    if args.use_ddp:
+        logging.info(f"Wrapping model with DistributedDataParallel on rank {args.local_rank}")
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[args.local_rank],
+            output_device=args.local_rank,
+            find_unused_parameters=False,
+        )
+    
     # Log model sizing info.
     num_sequences = len(pcvr_dataset.seq_domains)
     num_ns = model.num_ns
@@ -331,10 +386,6 @@ def main() -> None:
         "head": args.num_heads,
         "hidden": args.d_model,
     }
-
-    if args.device.startswith('cuda') and torch.cuda.device_count() > 1:
-        logging.info(f"Using {torch.cuda.device_count()} GPUs for DataParallel training.")
-        model = torch.nn.DataParallel(model)
 
     trainer = PCVRHyFormerRankingTrainer(
         model=model,
@@ -360,9 +411,15 @@ def main() -> None:
         train_config=vars(args),
         compile_model=args.compile,
         use_amp=args.use_amp,
+        use_ddp=args.use_ddp,
+        local_rank=args.local_rank,
     )
 
     trainer.train()
+    
+    if args.use_ddp:
+        dist.destroy_process_group()
+    
     writer.close()
 
     logging.info("Training complete!")

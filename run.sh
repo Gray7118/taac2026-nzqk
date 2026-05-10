@@ -1,4 +1,3 @@
-#!/bin/bash
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 
@@ -9,18 +8,51 @@ export TRAIN_LOG_PATH="./logs"
 export TRAIN_TF_EVENTS_PATH="./tf_events"
 #----- NOTE: manually set this for test locally -----#
 
-# ---- Active config: RankMixer NS tokenizer (no ns_groups.json required) ----
-python3 -u "${SCRIPT_DIR}/train.py" \
-    --ns_tokenizer_type rankmixer \
-    --user_ns_tokens 5 \
-    --item_ns_tokens 2 \
-    --num_queries 2 \
-    --ns_groups_json "" \
-    --emb_skip_threshold 1000000 \
-    --num_workers 8 \
-    --compile \
-    --use_amp \
-    "$@"
+echo "[run.sh] Detecting GPU count..."
+GPU_COUNT=$(python3 -c "import torch; print(torch.cuda.device_count() if torch.cuda.is_available() else 0)" 2>/dev/null || echo "0")
+echo "[run.sh] Found $GPU_COUNT GPUs"
+
+# Single GPU (for debugging only):
+# python3 -u "${SCRIPT_DIR}/train.py" \
+#     --ns_tokenizer_type rankmixer \
+#     --user_ns_tokens 5 \
+#     --item_ns_tokens 2 \
+#     --compile \
+#     --use_amp \
+#     "$@"
+
+if [ "$GPU_COUNT" -gt 1 ]; then
+    echo "[run.sh] Running with DDP on $GPU GPUs..."
+    torchrun \
+        --nproc_per_node=$GPU_COUNT \
+        --nnodes=1 \
+        --master_port=29500 \
+        "${SCRIPT_DIR}/train.py" \
+        --ns_tokenizer_type rankmixer \
+        --user_ns_tokens 5 \
+        --item_ns_tokens 2 \
+        --num_queries 2 \
+        --ns_groups_json "" \
+        --emb_skip_threshold 1000000 \
+        --num_workers 8 \
+        --compile \
+        --use_amp \
+        "$@"
+else
+    echo "[run.sh] Falling back to single-GPU mode ($GPU_COUNT GPUs detected)"
+    python3 -u "${SCRIPT_DIR}/train.py" \
+        --ns_tokenizer_type rankmixer \
+        --user_ns_tokens 5 \
+        --item_ns_tokens 2 \
+        --num_queries 2 \
+        --ns_groups_json "" \
+        --batch_size 1024 \
+        --emb_skip_threshold 1000000 \
+        --num_workers 8 \
+        --compile \
+        --use_amp \
+        "$@"
+fi
 
 # ---- Alternative config: GroupNSTokenizer driven by ns_groups.json ----
 # Uses feature grouping from ns_groups.json (7 user groups + 4 item groups).

@@ -61,8 +61,12 @@ class PCVRHyFormerRankingTrainer:
         train_config: Optional[Dict[str, Any]] = None,
         compile_model: bool = False,
         use_amp: bool = False,
+        use_ddp: bool = False,
+        local_rank: int = 0,
     ) -> None:
         self.model: nn.Module = model
+        self.use_ddp = use_ddp
+        self.local_rank = local_rank
         self.train_loader: DataLoader = train_loader
         self.valid_loader: DataLoader = valid_loader
         self.writer = writer
@@ -75,7 +79,9 @@ class PCVRHyFormerRankingTrainer:
         # do not ship ns_groups.json separately.
         self.ns_groups_path: Optional[str] = ns_groups_path
 
-        self.raw_model = model.module if isinstance(model, nn.DataParallel) else model
+        # Support both DataParallel and DistributedDataParallel
+        is_parallelized = hasattr(model, 'module')
+        self.raw_model = model.module if is_parallelized else model
 
         # Dual optimizer: Adagrad for sparse Embeddings, AdamW for dense params.
         self.sparse_optimizer: Optional[torch.optim.Optimizer]
@@ -84,8 +90,8 @@ class PCVRHyFormerRankingTrainer:
             dense_params = self.raw_model.get_dense_params()
             sparse_param_count = sum(p.numel() for p in sparse_params)
             dense_param_count = sum(p.numel() for p in dense_params)
-            logging.info(f"Sparse params: {len(sparse_params)} tensors, {sparse_param_count:,} parameters (Adagrad lr={sparse_lr})")
-            logging.info(f"Dense params: {len(dense_params)} tensors, {dense_param_count:,} parameters (AdamW lr={lr})")
+            self._log(f"Sparse params: {len(sparse_params)} tensors, {sparse_param_count:,} parameters (Adagrad lr={sparse_lr})")
+            self._log(f"Dense params: {len(dense_params)} tensors, {dense_param_count:,} parameters (AdamW lr={lr})")
             self.sparse_optimizer = torch.optim.Adagrad(
                 sparse_params, lr=sparse_lr, weight_decay=sparse_weight_decay
             )
@@ -118,16 +124,27 @@ class PCVRHyFormerRankingTrainer:
         self.grad_scaler = torch.amp.GradScaler(device="cuda", enabled=True) if self.use_amp and self.device.startswith("cuda") else None
 
         if self.compile_model:
-            logging.info("Compiling model for training and inference...")
+            self._log("Compiling model for training and inference...")
             self.forward_model = torch.compile(self.model)
             self.predict_fn = torch.compile(self.raw_model.predict)
         else:
             self.forward_model = self.model
             self.predict_fn = self.raw_model.predict
 
-        logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
-                     f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
-                     f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}")
+        self._log(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
+                  f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
+                  f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}")
+
+    def _is_rank_zero(self) -> bool:
+        """Check if current process should do logging/saving operations."""
+        if not self.use_ddp:
+            return True
+        return self.local_rank == 0
+
+    def _log(self, message: str):
+        """Log only from rank zero."""
+        if self._is_rank_zero():
+            logging.info(message)
 
     def _build_step_dir_name(self, global_step: int, is_best: bool = False) -> str:
         """Build a checkpoint sub-directory name such as
@@ -208,7 +225,7 @@ class PCVRHyFormerRankingTrainer:
         if not skip_model_file:
             torch.save(self.raw_model.state_dict(), os.path.join(ckpt_dir, "model.pt"))
         self._write_sidecar_files(ckpt_dir)
-        logging.info(f"Saved checkpoint to {ckpt_dir}/model.pt")
+        self._log(f"Saved checkpoint to {ckpt_dir}/model.pt")
         return ckpt_dir
 
     def _remove_old_best_dirs(self) -> None:
@@ -218,7 +235,7 @@ class PCVRHyFormerRankingTrainer:
         pattern = os.path.join(self.save_dir, "global_step*.best_model")
         for old_dir in glob.glob(pattern):
             shutil.rmtree(old_dir)
-            logging.info(f"Removed old best_model dir: {old_dir}")
+            self._log(f"Removed old best_model dir: {old_dir}")
 
     def _batch_to_device(self, batch: Dict[str, Any]) -> Dict[str, Any]:
         """Move all tensors in ``batch`` to ``self.device`` (``non_blocking=True``,
@@ -311,13 +328,13 @@ class PCVRHyFormerRankingTrainer:
         print("Start training (PCVRHyFormer)")
         self.model.train()
         total_step = 0
-        st_ep_time = time()
 
         for epoch in range(1, self.num_epochs + 1):
             train_pbar = tqdm(enumerate(self.train_loader), total=len(self.train_loader),
                               dynamic_ncols=True)
             loss_sum = 0.0
 
+            st_ep_time = time()
             for step, batch in train_pbar:
                 loss = self._train_step(batch)
                 total_step += 1
@@ -330,12 +347,12 @@ class PCVRHyFormerRankingTrainer:
 
                 # Step-level validation (only when eval_every_n_steps > 0).
                 if self.eval_every_n_steps > 0 and total_step % self.eval_every_n_steps == 0:
-                    logging.info(f"Evaluating at step {total_step}")
+                    self._log(f"Evaluating at step {total_step}")
                     val_auc, val_logloss = self.evaluate(epoch=epoch)
                     self.model.train()
                     torch.cuda.empty_cache()
 
-                    logging.info(f"Step {total_step} Validation | AUC: {val_auc}, LogLoss: {val_logloss}")
+                    self._log(f"Step {total_step} Validation | AUC: {val_auc}, LogLoss: {val_logloss}")
 
                     if self.writer:
                         self.writer.add_scalar('AUC/valid', val_auc, total_step)
@@ -344,18 +361,18 @@ class PCVRHyFormerRankingTrainer:
                     self._handle_validation_result(total_step, val_auc, val_logloss)
 
                     if self.early_stopping.early_stop:
-                        logging.info(f"Early stopping at step {total_step}")
+                        self._log(f"Early stopping at step {total_step}")
                         return
             ed_ep_time = time()
 
             train_loader_len = max(1, len(self.train_loader))
-            logging.info(f"Epoch {epoch}, Average Loss: {loss_sum / train_loader_len}, Time: {(ed_ep_time - st_ep_time)/60:.2f}min")
+            self._log(f"Epoch {epoch}, Average Loss: {loss_sum / train_loader_len}, Time: {(ed_ep_time - st_ep_time)/60:.2f}min")
 
             val_auc, val_logloss = self.evaluate(epoch=epoch)
             self.model.train()
             torch.cuda.empty_cache()
 
-            logging.info(f"Epoch {epoch} Validation | AUC: {val_auc}, LogLoss: {val_logloss}")
+            self._log(f"Epoch {epoch} Validation | AUC: {val_auc}, LogLoss: {val_logloss}")
 
             if self.writer:
                 self.writer.add_scalar('AUC/valid', val_auc, total_step)
@@ -364,7 +381,7 @@ class PCVRHyFormerRankingTrainer:
             self._handle_validation_result(total_step, val_auc, val_logloss)
 
             if self.early_stopping.early_stop:
-                logging.info(f"Early stopping at epoch {epoch}")
+                self._log(f"Early stopping at epoch {epoch}")
                 break
 
             # After the configured epoch, reinitialize high-cardinality sparse
@@ -392,10 +409,11 @@ class PCVRHyFormerRankingTrainer:
                     if p.data_ptr() not in reinit_ptrs and p.data_ptr() in old_state:
                         self.sparse_optimizer.state[p] = old_state[p.data_ptr()]
                         restored += 1
-                logging.info(f"Rebuilt Adagrad optimizer after epoch {epoch}, "
-                             f"restored optimizer state for {restored} low-cardinality params")
+                self._log(f"Rebuilt Adagrad optimizer after epoch {epoch}, "
+                          f"restored optimizer state for {restored} low-cardinality params")
 
     def _make_model_input(self, device_batch: Dict[str, Any]) -> ModelInput:
+
         """Construct a ``ModelInput`` NamedTuple from a device_batch dict."""
         seq_domains = device_batch['_seq_domains']
         seq_data: Dict[str, torch.Tensor] = {}

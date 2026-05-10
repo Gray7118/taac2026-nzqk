@@ -681,7 +681,10 @@ def get_pcvr_data(
     seed: int = 42,
     clip_vocab: bool = True,
     seq_max_lens: Optional[Dict[str, int]] = None,
-    **kwargs: Any,
+    # NEW PARAMETERS FOR DISTRIBUTED TRAINING:
+    use_ddp: bool = False,
+    world_size: int = 1,
+    local_rank: int = 0,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
 
@@ -707,18 +710,42 @@ def get_pcvr_data(
     total_rgs = len(rg_info)
 
     n_valid_rgs = max(1, int(total_rgs * valid_ratio))
-    n_train_rgs = total_rgs - n_valid_rgs
+    n_train_rgs_total = total_rgs - n_valid_rgs
 
     # train_ratio: use only the first N% of the training Row Groups.
     if train_ratio < 1.0:
-        n_train_rgs = max(1, int(n_train_rgs * train_ratio))
-        logging.info(f"train_ratio={train_ratio}: using {n_train_rgs} train Row Groups")
+        n_train_rgs_total = max(1, int(n_train_rgs_total * train_ratio))
+        logging.info(f"train_ratio={train_ratio}: using {n_train_rgs_total} train Row Groups")
 
-    train_rows = sum(r[2] for r in rg_info[:n_train_rgs])
-    valid_rows = sum(r[2] for r in rg_info[n_train_rgs:])
-
-    logging.info(f"Row Group split: {n_train_rgs} train ({train_rows} rows), "
-                 f"{n_valid_rgs} valid ({valid_rows} rows)")
+    # Distribute training rows across ranks via row group slicing
+    if use_ddp:
+        rg_stride = n_train_rgs_total // world_size
+        rg_start = local_rank * rg_stride
+        rg_end = min((local_rank + 1) * rg_stride, n_train_rgs_total)
+        
+        # Compute row counts for this rank
+        train_rows_this_rank = sum(r[2] for r in rg_info[rg_start:rg_end])
+        valid_rows_unaffected = sum(r[2] for r in rg_info[n_train_rgs_total:])
+        
+        logging.info(
+            f"[Rank {local_rank}] Using row_groups [{rg_start}:{rg_end}] "
+            f"({train_rows_this_rank} samples), "
+            f"validation: {valid_rows_unaffected} samples"
+        )
+        
+        train_row_group_range = (rg_start, rg_end)
+        n_train_rgs = n_train_rgs_total  # Also define for validation slice calculation
+    else:
+        rg_start, rg_end = 0, n_train_rgs_total
+        
+        # Log overall split info (mainly useful for single-GPU mode)
+        train_rows_all = sum(r[2] for r in rg_info[:n_train_rgs_total])
+        valid_rows_all = sum(r[2] for r in rg_info[n_train_rgs_total:])
+        logging.info(f"Row Group split: {n_train_rgs_total} train ({train_rows_all} rows), "
+                     f"{n_valid_rgs} valid ({valid_rows_all} rows)")
+        
+        train_row_group_range = (0, n_train_rgs_total)
+        n_train_rgs = n_train_rgs_total  # Define for backward compatibility
 
     train_dataset = PCVRParquetDataset(
         parquet_path=data_dir,
@@ -727,7 +754,20 @@ def get_pcvr_data(
         seq_max_lens=seq_max_lens,
         shuffle=shuffle_train,
         buffer_batches=buffer_batches,
-        row_group_range=(0, n_train_rgs),
+        row_group_range=train_row_group_range,
+        clip_vocab=clip_vocab,
+    )
+
+    # Create validation dataset (same for all ranks)
+    valid_start = n_train_rgs_total if use_ddp else n_train_rgs
+    valid_dataset = PCVRParquetDataset(
+        parquet_path=data_dir,
+        schema_path=schema_path,
+        batch_size=batch_size,
+        seq_max_lens=seq_max_lens,
+        shuffle=False,
+        buffer_batches=0,
+        row_group_range=(valid_start, total_rgs),
         clip_vocab=clip_vocab,
     )
 
@@ -741,23 +781,20 @@ def get_pcvr_data(
         train_dataset, batch_size=None,
         num_workers=num_workers, pin_memory=use_cuda, **_train_kw,
     )
-
-    valid_dataset = PCVRParquetDataset(
-        parquet_path=data_dir,
-        schema_path=schema_path,
-        batch_size=batch_size,
-        seq_max_lens=seq_max_lens,
-        shuffle=False,
-        buffer_batches=0,
-        row_group_range=(n_train_rgs, total_rgs),
-        clip_vocab=clip_vocab,
-    )
+    
     valid_loader = DataLoader(
         valid_dataset, batch_size=None,
         num_workers=0, pin_memory=use_cuda,
     )
 
-    logging.info(f"Parquet train: {train_rows} rows, valid: {valid_rows} rows, "
-                 f"batch_size={batch_size}, buffer_batches={buffer_batches}")
+    if use_ddp:
+        logging.info(
+            f"[Rank {local_rank}] Parquet train: {train_rows_this_rank} rows, "
+            f"valid: {valid_rows_unaffected} rows, "
+            f"batch_size={batch_size}, buffer_batches={buffer_batches}"
+        )
+    else:
+        logging.info(f"Parquet train: {train_rows_all} rows, valid: {valid_rows_all} rows, "
+                     f"batch_size={batch_size}, buffer_batches={buffer_batches}")
 
     return train_loader, valid_loader, train_dataset
