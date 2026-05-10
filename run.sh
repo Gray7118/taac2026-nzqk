@@ -2,6 +2,13 @@
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 
+#----- NOTE: manually set this for test locally -----#
+export TRAIN_DATA_PATH="/nfs1/SDW/20260428-TAAC2026/data_sample_1000"
+export TRAIN_CKPT_PATH="./checkpoints"
+export TRAIN_LOG_PATH="./logs"
+export TRAIN_TF_EVENTS_PATH="./tf_events"
+#----- NOTE: manually set this for test locally -----#
+
 # ---- Active config: RankMixer NS tokenizer (no ns_groups.json required) ----
 python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_tokenizer_type rankmixer \
@@ -11,6 +18,8 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_groups_json "" \
     --emb_skip_threshold 1000000 \
     --num_workers 8 \
+    --compile \
+    --use_amp \
     "$@"
 
 # ---- Alternative config: GroupNSTokenizer driven by ns_groups.json ----

@@ -67,6 +67,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--device', type=str,
                         default='cuda' if torch.cuda.is_available() else 'cpu',
                         help='Training device, e.g. cuda or cpu')
+    parser.add_argument('--compile', action='store_true', default=False,
+                        help='Whether to use torch.compile for the model')
+    parser.add_argument('--use_amp', action='store_true', default=False,
+                        help='Whether to use torch.autocast for mixed precision (AMP)')
 
     # Data pipeline.
     parser.add_argument('--num_workers', type=int, default=16,
@@ -328,6 +332,10 @@ def main() -> None:
         "hidden": args.d_model,
     }
 
+    if args.device.startswith('cuda') and torch.cuda.device_count() > 1:
+        logging.info(f"Using {torch.cuda.device_count()} GPUs for DataParallel training.")
+        model = torch.nn.DataParallel(model)
+
     trainer = PCVRHyFormerRankingTrainer(
         model=model,
         train_loader=train_loader,
@@ -350,6 +358,8 @@ def main() -> None:
         ns_groups_path=args.ns_groups_json if args.ns_groups_json and os.path.exists(args.ns_groups_json) else None,
         eval_every_n_steps=args.eval_every_n_steps,
         train_config=vars(args),
+        compile_model=args.compile,
+        use_amp=args.use_amp,
     )
 
     trainer.train()

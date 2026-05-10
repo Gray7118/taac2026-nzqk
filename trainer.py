@@ -20,6 +20,7 @@ from sklearn.metrics import roc_auc_score
 
 from utils import sigmoid_focal_loss, EarlyStopping
 from model import ModelInput
+from time import time
 
 
 class PCVRHyFormerRankingTrainer:
@@ -58,6 +59,8 @@ class PCVRHyFormerRankingTrainer:
         ns_groups_path: Optional[str] = None,
         eval_every_n_steps: int = 0,
         train_config: Optional[Dict[str, Any]] = None,
+        compile_model: bool = False,
+        use_amp: bool = False,
     ) -> None:
         self.model: nn.Module = model
         self.train_loader: DataLoader = train_loader
@@ -72,11 +75,13 @@ class PCVRHyFormerRankingTrainer:
         # do not ship ns_groups.json separately.
         self.ns_groups_path: Optional[str] = ns_groups_path
 
+        self.raw_model = model.module if isinstance(model, nn.DataParallel) else model
+
         # Dual optimizer: Adagrad for sparse Embeddings, AdamW for dense params.
         self.sparse_optimizer: Optional[torch.optim.Optimizer]
-        if hasattr(model, 'get_sparse_params'):
-            sparse_params = model.get_sparse_params()
-            dense_params = model.get_dense_params()
+        if hasattr(self.raw_model, 'get_sparse_params'):
+            sparse_params = self.raw_model.get_sparse_params()
+            dense_params = self.raw_model.get_dense_params()
             sparse_param_count = sum(p.numel() for p in sparse_params)
             dense_param_count = sum(p.numel() for p in dense_params)
             logging.info(f"Sparse params: {len(sparse_params)} tensors, {sparse_param_count:,} parameters (Adagrad lr={sparse_lr})")
@@ -90,7 +95,7 @@ class PCVRHyFormerRankingTrainer:
         else:
             self.sparse_optimizer = None
             self.dense_optimizer = torch.optim.AdamW(
-                model.parameters(), lr=lr, betas=(0.9, 0.98)
+                self.model.parameters(), lr=lr, betas=(0.9, 0.98)
             )
 
         self.num_epochs: int = num_epochs
@@ -107,6 +112,18 @@ class PCVRHyFormerRankingTrainer:
         self.ckpt_params: Dict[str, Any] = ckpt_params or {}
         self.eval_every_n_steps: int = eval_every_n_steps
         self.train_config: Optional[Dict[str, Any]] = train_config
+        self.compile_model: bool = compile_model
+        self.use_amp: bool = use_amp
+
+        self.grad_scaler = torch.amp.GradScaler(device="cuda", enabled=True) if self.use_amp and self.device.startswith("cuda") else None
+
+        if self.compile_model:
+            logging.info("Compiling model for training and inference...")
+            self.forward_model = torch.compile(self.model)
+            self.predict_fn = torch.compile(self.raw_model.predict)
+        else:
+            self.forward_model = self.model
+            self.predict_fn = self.raw_model.predict
 
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
@@ -189,7 +206,7 @@ class PCVRHyFormerRankingTrainer:
         ckpt_dir = os.path.join(self.save_dir, dir_name)
         os.makedirs(ckpt_dir, exist_ok=True)
         if not skip_model_file:
-            torch.save(self.model.state_dict(), os.path.join(ckpt_dir, "model.pt"))
+            torch.save(self.raw_model.state_dict(), os.path.join(ckpt_dir, "model.pt"))
         self._write_sidecar_files(ckpt_dir)
         logging.info(f"Saved checkpoint to {ckpt_dir}/model.pt")
         return ckpt_dir
@@ -294,6 +311,7 @@ class PCVRHyFormerRankingTrainer:
         print("Start training (PCVRHyFormer)")
         self.model.train()
         total_step = 0
+        st_ep_time = time()
 
         for epoch in range(1, self.num_epochs + 1):
             train_pbar = tqdm(enumerate(self.train_loader), total=len(self.train_loader),
@@ -328,8 +346,10 @@ class PCVRHyFormerRankingTrainer:
                     if self.early_stopping.early_stop:
                         logging.info(f"Early stopping at step {total_step}")
                         return
+            ed_ep_time = time()
 
-            logging.info(f"Epoch {epoch}, Average Loss: {loss_sum / len(self.train_loader)}")
+            train_loader_len = max(1, len(self.train_loader))
+            logging.info(f"Epoch {epoch}, Average Loss: {loss_sum / train_loader_len}, Time: {(ed_ep_time - st_ep_time)/60:.2f}min")
 
             val_auc, val_logloss = self.evaluate(epoch=epoch)
             self.model.train()
@@ -361,8 +381,8 @@ class PCVRHyFormerRankingTrainer:
                         if p.data_ptr() in self.sparse_optimizer.state:
                             old_state[p.data_ptr()] = self.sparse_optimizer.state[p]
 
-                reinit_ptrs = self.model.reinit_high_cardinality_params(self.reinit_cardinality_threshold)
-                sparse_params = self.model.get_sparse_params()
+                reinit_ptrs = self.raw_model.reinit_high_cardinality_params(self.reinit_cardinality_threshold)
+                sparse_params = self.raw_model.get_sparse_params()
                 self.sparse_optimizer = torch.optim.Adagrad(
                     sparse_params, lr=self.sparse_lr, weight_decay=self.sparse_weight_decay
                 )
@@ -409,21 +429,40 @@ class PCVRHyFormerRankingTrainer:
             self.sparse_optimizer.zero_grad()
 
         model_input = self._make_model_input(device_batch)
-        logits = self.model(model_input)  # (B, 1)
-        logits = logits.squeeze(-1)  # (B,)
+        
+        device_type = 'cuda' if self.device.startswith('cuda') else 'cpu'
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=self.use_amp):
+            logits = self.forward_model(model_input)  # (B, 1)
+            logits = logits.squeeze(-1)  # (B,)
 
-        if self.loss_type == 'focal':
-            loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
+            if self.loss_type == 'focal':
+                loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
+            else:
+                loss = F.binary_cross_entropy_with_logits(logits, label)
+        
+        if self.grad_scaler is not None:
+            self.grad_scaler.scale(loss).backward()
+            
+            # unscale prior to clip_grad_norm
+            self.grad_scaler.unscale_(self.dense_optimizer)
+            if self.sparse_optimizer is not None:
+                self.grad_scaler.unscale_(self.sparse_optimizer)
+                
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, foreach=False)
+            
+            self.grad_scaler.step(self.dense_optimizer)
+            if self.sparse_optimizer is not None:
+                self.grad_scaler.step(self.sparse_optimizer)
+            self.grad_scaler.update()
         else:
-            loss = F.binary_cross_entropy_with_logits(logits, label)
-        loss.backward()
-        # foreach=False: avoids a PyTorch _foreach_norm CUDA kernel bug observed
-        # with certain tensor shapes in this project.
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, foreach=False)
+            loss.backward()
+            # foreach=False: avoids a PyTorch _foreach_norm CUDA kernel bug observed
+            # with certain tensor shapes in this project.
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, foreach=False)
 
-        self.dense_optimizer.step()
-        if self.sparse_optimizer is not None:
-            self.sparse_optimizer.step()
+            self.dense_optimizer.step()
+            if self.sparse_optimizer is not None:
+                self.sparse_optimizer.step()
 
         return loss.item()
 
@@ -488,7 +527,9 @@ class PCVRHyFormerRankingTrainer:
         label = device_batch['label']
 
         model_input = self._make_model_input(device_batch)
-        logits, _ = self.model.predict(model_input)  # (B, 1), (B, D)
-        logits = logits.squeeze(-1)  # (B,)
+        device_type = 'cuda' if self.device.startswith('cuda') else 'cpu'
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=self.use_amp):
+            logits, _ = self.predict_fn(model_input)  # (B, 1), (B, D)
+        logits = logits.squeeze(-1).float()  # (B,)
 
         return logits, label
