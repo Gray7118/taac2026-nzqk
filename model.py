@@ -15,7 +15,7 @@ class ModelInput(NamedTuple):
     item_dense_feats: torch.Tensor
     seq_data: dict        # {domain: tensor [B, S, L]}
     seq_lens: dict        # {domain: tensor [B]}
-    seq_time_buckets: dict  # {domain: tensor [B, L]}
+    seq_time_buckets: dict  # {domain: tensor [B, 4, L]}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1219,7 +1219,7 @@ class PCVRHyFormer(nn.Module):
         seq_top_k: int = 50,
         seq_causal: bool = False,
         action_num: int = 1,
-        num_time_buckets: int = 65,
+        time_scale_config: dict = None,
         rank_mixer_mode: str = 'full',
         use_rope: bool = False,
         rope_base: float = 10000.0,
@@ -1238,7 +1238,12 @@ class PCVRHyFormer(nn.Module):
         self.num_queries = num_queries
         self.seq_domains = sorted(seq_vocab_sizes.keys())  # deterministic order
         self.num_sequences = len(self.seq_domains)
-        self.num_time_buckets = num_time_buckets
+        self.time_embs = None
+        if time_scale_config:
+            self.time_embs = nn.ModuleDict({
+                scale: nn.Embedding(cfg['num_buckets'], d_model, padding_idx=0)
+                for scale, cfg in time_scale_config.items()
+            })
         self.rank_mixer_mode = rank_mixer_mode
         self.use_rope = use_rope
         self.emb_skip_threshold = emb_skip_threshold
@@ -1374,8 +1379,7 @@ class PCVRHyFormer(nn.Module):
             )
 
         # ================== Time Interval Bucket Embedding (optional) ==================
-        if num_time_buckets > 0:
-            self.time_embedding = nn.Embedding(num_time_buckets, d_model, padding_idx=0)
+        # time_embs is already set above from time_scale_config.
 
         # ================== HyFormer Components ==================
         # MultiSeqQueryGenerator
@@ -1463,9 +1467,10 @@ class PCVRHyFormer(nn.Module):
                 nn.init.xavier_normal_(emb.weight.data)
                 emb.weight.data[0, :] = 0
 
-        if self.num_time_buckets > 0:
-            nn.init.xavier_normal_(self.time_embedding.weight.data)
-            self.time_embedding.weight.data[0, :] = 0
+        if self.time_embs is not None:
+            for emb in self.time_embs.values():
+                nn.init.xavier_normal_(emb.weight.data)
+                emb.weight.data[0, :] = 0
 
     def reinit_high_cardinality_params(
         self, cardinality_threshold: int = 10000
@@ -1520,9 +1525,9 @@ class PCVRHyFormer(nn.Module):
                 else:
                     skip_count += 1
 
-        # time_embedding is always preserved
-        if self.num_time_buckets > 0:
-            skip_count += 1
+        # time_embs are always preserved
+        if self.time_embs is not None:
+            skip_count += len(self.time_embs)
 
         logging.info(f"Re-initialized {reinit_count} high-cardinality Embeddings "
                      f"(vocab>{cardinality_threshold}), kept {skip_count}")
@@ -1567,9 +1572,11 @@ class PCVRHyFormer(nn.Module):
         cat_emb = torch.cat(emb_list, dim=-1)  # (B, L, S*emb_dim)
         token_emb = F.gelu(proj(cat_emb))  # (B, L, D)
 
-        # Add time bucket embedding (all-zero ids produce zero vectors via padding_idx=0)
-        if self.num_time_buckets > 0:
-            token_emb = token_emb + self.time_embedding(time_bucket_ids)
+        # Add multi-scale time bucket embeddings (all-zero ids produce zero
+        # vectors via padding_idx=0).
+        if self.time_embs is not None:
+            for ch, emb in enumerate(self.time_embs.values()):
+                token_emb = token_emb + emb(time_bucket_ids[:, ch, :])
 
         return token_emb
 

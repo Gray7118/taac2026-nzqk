@@ -8,6 +8,15 @@ export TRAIN_LOG_PATH="./logs"
 export TRAIN_TF_EVENTS_PATH="./tf_events"
 #----- NOTE: manually set this for test locally -----#
 
+#----- Patch schema.json: activate time features by setting ts_fid -----#
+echo "[run.sh] Patching schema.json to activate time features..."
+mkdir -p "${TRAIN_CKPT_PATH}"
+FIXED_SCHEMA="${TRAIN_CKPT_PATH}/schema_patched.json"
+python3 "${SCRIPT_DIR}/fix_schema.py" \
+    "${TRAIN_DATA_PATH}/schema.json" \
+    "${FIXED_SCHEMA}"
+echo "[run.sh] Using patched schema: ${FIXED_SCHEMA}"
+
 echo "[run.sh] Detecting GPU count..."
 GPU_COUNT=$(python3 -c "import torch; print(torch.cuda.device_count() if torch.cuda.is_available() else 0)" 2>/dev/null || echo "0")
 echo "[run.sh] Found $GPU_COUNT GPUs"
@@ -28,6 +37,7 @@ if [ "$GPU_COUNT" -gt 1 ]; then
         --nnodes=1 \
         --master_port=29500 \
         "${SCRIPT_DIR}/train.py" \
+        --schema_path "${FIXED_SCHEMA}" \
         --ns_tokenizer_type rankmixer \
         --user_ns_tokens 5 \
         --item_ns_tokens 2 \
@@ -41,12 +51,13 @@ if [ "$GPU_COUNT" -gt 1 ]; then
 else
     echo "[run.sh] Falling back to single-GPU mode ($GPU_COUNT GPUs detected)"
     python3 -u "${SCRIPT_DIR}/train.py" \
+        --schema_path "${FIXED_SCHEMA}" \
         --ns_tokenizer_type rankmixer \
         --user_ns_tokens 5 \
         --item_ns_tokens 2 \
         --num_queries 2 \
         --ns_groups_json "" \
-        --batch_size 1024 \
+        --batch_size 1280 \
         --emb_skip_threshold 1000000 \
         --num_workers 8 \
         --compile \

@@ -106,30 +106,55 @@ class FeatureSchema:
 # out of shared memory when many DataLoader workers are active.
 torch.multiprocessing.set_sharing_strategy('file_system')
 
-# Time-delta bucket boundaries (64 edges -> 65 buckets: 0=padding, 1..64).
-BUCKET_BOUNDARIES = np.array([
-    5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60,
-    120, 180, 240, 300, 360, 420, 480, 540, 600,
-    900, 1200, 1500, 1800, 2100, 2400, 2700, 3000, 3300, 3600,
-    5400, 7200, 9000, 10800, 12600, 14400, 16200, 18000, 19800, 21600,
-    32400, 43200, 54000, 64800, 75600, 86400,
-    172800, 259200, 345600, 432000, 518400, 604800,
-    1123200, 1641600, 2160000, 2592000,
-    4320000, 6048000, 7776000,
-    11664000, 15552000,
-    31536000,
-], dtype=np.int64)
+# ── Multi-scale time-delta bucket boundaries ──
+#
+# Four independent temporal scales, each with its own boundary array and
+# Embedding table.  The scales are designed to capture different behavioural
+# rhythms in a CVR task:
+#
+#   fine      5s – 1h      short-term browsing tempo (flick vs. dwell)
+#   medium    1h – 1d      intra-day cycle (morning / afternoon / evening)
+#   coarse    1d – 7d      return frequency (daily-active vs. weekly)
+#   longterm  7d – 1y      long-range interest drift / rekindling
+#
+# Keeping the scales separate prevents a single over-subscribed Embedding
+# table from conflating semantically distinct temporal regimes.
+FINE_BOUNDARIES = np.array(
+    [5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 300, 600, 900, 1800, 3600],
+    dtype=np.int64,
+)
+MEDIUM_BOUNDARIES = np.array(
+    [7200, 10800, 14400, 18000, 21600, 25200, 28800, 32400,
+     36000, 43200, 50400, 57600, 64800, 72000, 79200, 86400],
+    dtype=np.int64,
+)
+COARSE_BOUNDARIES = np.array(
+    [172800, 259200, 345600, 432000, 518400, 604800],
+    dtype=np.int64,
+)
+LONGTERM_BOUNDARIES = np.array(
+    [1209600, 2592000, 4320000, 6048000, 7776000,
+     11664000, 15552000, 31536000],
+    dtype=np.int64,
+)
 
-# Total number of time-bucket embedding slots (= number of boundaries + 1, with
-# padding=0 included).
-#
-# This constant is uniquely determined by the length of BUCKET_BOUNDARIES; on
-# the model side, ``nn.Embedding(num_embeddings=NUM_TIME_BUCKETS)`` must match
-# this value exactly, otherwise an IndexError may be raised at runtime.
-#
-# That is why ``train.py`` / ``infer.py`` only expose the boolean flag
-# ``--use_time_buckets`` and derive the concrete bucket count from here.
-NUM_TIME_BUCKETS = len(BUCKET_BOUNDARIES) + 1
+NUM_FINE_BUCKETS = len(FINE_BOUNDARIES) + 1      #  16
+NUM_MEDIUM_BUCKETS = len(MEDIUM_BOUNDARIES) + 1  #  17
+NUM_COARSE_BUCKETS = len(COARSE_BOUNDARIES) + 1  #   7
+NUM_LONGTERM_BUCKETS = len(LONGTERM_BOUNDARIES) + 1  #  9
+
+TIME_SCALE_CONFIG = {
+    'fine':      {'boundaries': FINE_BOUNDARIES,      'num_buckets': NUM_FINE_BUCKETS},
+    'medium':    {'boundaries': MEDIUM_BOUNDARIES,    'num_buckets': NUM_MEDIUM_BUCKETS},
+    'coarse':    {'boundaries': COARSE_BOUNDARIES,    'num_buckets': NUM_COARSE_BUCKETS},
+    'longterm':  {'boundaries': LONGTERM_BOUNDARIES,  'num_buckets': NUM_LONGTERM_BUCKETS},
+}
+NUM_TIME_SCALES = len(TIME_SCALE_CONFIG)  # 4
+
+# Backward-compatible alias — kept so that legacy checkpoints that write
+# ``num_time_buckets`` into train_config still resolve.  New code should use
+# ``TIME_SCALE_CONFIG`` instead.
+NUM_TIME_BUCKETS = sum(cfg['num_buckets'] for cfg in TIME_SCALE_CONFIG.values())  # 49
 
 
 class PCVRParquetDataset(IterableDataset):
@@ -225,7 +250,7 @@ class PCVRParquetDataset(IterableDataset):
             max_len = self._seq_maxlen[domain]
             n_feats = len(self.sideinfo_fids[domain])
             self._buf_seq[domain] = np.zeros((B, n_feats, max_len), dtype=np.int64)
-            self._buf_seq_tb[domain] = np.zeros((B, max_len), dtype=np.int64)
+            self._buf_seq_tb[domain] = np.zeros((B, NUM_TIME_SCALES, max_len), dtype=np.int64)
             self._buf_seq_lens[domain] = np.zeros(B, dtype=np.int64)
 
         # ---- Pre-compute (col_idx, offset, vocab_size) plans for int columns ----
@@ -627,14 +652,13 @@ class PCVRParquetDataset(IterableDataset):
             result[domain] = torch.from_numpy(out.copy())
             result[f'{domain}_len'] = torch.from_numpy(lengths.copy())
 
-            # Time bucketing.
+            # Time bucketing (multi-scale: 4 independent temporal granularities).
             time_bucket = self._buf_seq_tb[domain][:B]
             time_bucket[:] = 0
             if ts_ci is not None:
                 ts_col = batch.column(ts_ci)
                 ts_offs = ts_col.offsets.to_numpy()
                 ts_vals = ts_col.values.to_numpy()
-                # Pad timestamps into shape (B, max_len).
                 ts_padded = np.zeros((B, max_len), dtype=np.int64)
                 for i in range(B):
                     s = int(ts_offs[i])
@@ -647,22 +671,17 @@ class PCVRParquetDataset(IterableDataset):
 
                 ts_expanded = timestamps.reshape(-1, 1)
                 time_diff = np.maximum(ts_expanded - ts_padded, 0)
-                # np.searchsorted returns values in [0, len(BUCKET_BOUNDARIES)].
-                # After +1 the nominal range is [1, len(BUCKET_BOUNDARIES)+1];
-                # the upper bound only appears when time_diff exceeds the
-                # largest boundary (~1 year) and would index past
-                # nn.Embedding(NUM_TIME_BUCKETS=len(BUCKET_BOUNDARIES)+1).
-                # Clip raw result to [0, len(BUCKET_BOUNDARIES)-1] so the final
-                # bucket id (after +1) stays within [1, len(BUCKET_BOUNDARIES)]
-                # and is always a valid Embedding index. Time-diffs beyond the
-                # largest boundary collapse into the last bucket.
-                raw_buckets = np.clip(
-                    np.searchsorted(BUCKET_BOUNDARIES, time_diff.ravel()),
-                    0, len(BUCKET_BOUNDARIES) - 1,
-                )
-                buckets = raw_buckets.reshape(B, max_len) + 1
-                buckets[ts_padded == 0] = 0
-                time_bucket[:] = buckets
+                diff_1d = time_diff.ravel()
+
+                for ch, (scale_name, cfg) in enumerate(TIME_SCALE_CONFIG.items()):
+                    boundaries = cfg['boundaries']
+                    raw = np.clip(
+                        np.searchsorted(boundaries, diff_1d),
+                        0, len(boundaries) - 1,
+                    )
+                    buckets = raw.reshape(B, max_len) + 1
+                    buckets[ts_padded == 0] = 0
+                    time_bucket[:, ch, :] = buckets
 
             result[f'{domain}_time_bucket'] = torch.from_numpy(time_bucket.copy())
 

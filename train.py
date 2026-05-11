@@ -21,7 +21,7 @@ import torch
 import torch.distributed as dist
 
 from utils import set_seed, EarlyStopping, create_logger
-from dataset import FeatureSchema, get_pcvr_data, NUM_TIME_BUCKETS
+from dataset import FeatureSchema, get_pcvr_data, TIME_SCALE_CONFIG
 from model import PCVRHyFormer
 from trainer import PCVRHyFormerRankingTrainer
 
@@ -342,7 +342,7 @@ def main() -> None:
         "seq_top_k": args.seq_top_k,
         "seq_causal": args.seq_causal,
         "action_num": args.action_num,
-        "num_time_buckets": NUM_TIME_BUCKETS if args.use_time_buckets else 0,
+        "time_scale_config": TIME_SCALE_CONFIG if args.use_time_buckets else None,
         "rank_mixer_mode": args.rank_mixer_mode,
         "use_rope": args.use_rope,
         "rope_base": args.rope_base,
